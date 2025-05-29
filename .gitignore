@@ -136,3 +136,5 @@ data/*
 checkpoints/*
 results/*
 wandb/*
+inaturalist_aws_tests/*
+!inaturalist_aws_tests/*.py

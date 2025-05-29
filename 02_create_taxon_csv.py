@@ -73,7 +73,14 @@ def create_species_data_csv(data_src):
     print("\n---\nHow many entries have common names?")
     print(df['preferred_common_name'].nunique())
 
-    # check what photo licenses there are...
+    # is the photo ID the same as the species ID?
+    print("\n---\nAre photo IDs different from iNat IDs?")
+    test_inat_id = data['results'][0]['taxon']['id']
+    test_im_id = data['results'][0]['taxon']['default_photo']['id']
+    print(test_inat_id, test_im_id)
+    print(f"{'yeah' if test_inat_id != test_im_id else 'nah'}")
+
+    df.to_csv('data/02_taxon_collected_data.csv')
 
 
 if __name__=="__main__":
