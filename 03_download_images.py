@@ -1,8 +1,9 @@
+import os
+import json
 import math
 import pandas as pd
 import requests
 from time import sleep
-import re
 from retrying import retry
 from requests.exceptions import RequestException
 from os import mkdir
@@ -11,29 +12,16 @@ from tqdm import tqdm
 
 min_sleep = 0.2
 current_sleep = min_sleep
-image_sizes = [
-    "square",  # 75px
-    "thumb",  # 100px
-    "small",  # 240px
-    "medium",  # 500px
-    "large",  # 1024px
-    "original" # 2048px
-]
-
+image_sizes = ["square", "thumb", "small", "medium", "large", "original"]
 data_path = "data"
-
+checkpoint_path = os.path.join(data_path, "checkpoint.json")
 
 def get_query(taxon_id, place_id=None, page=None):
-    set_place_str = f"&place_id={str(place_id)}"  # additional string to restrict image sources to location ID
-    set_page_nbr = f"&page={str(page)}"
-    return f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&license=cc-by%2Ccc-by-sa%2Ccc0&photo_license=cc-by%2Ccc-by-sa%2Ccc0{set_place_str if place_id is not None else ''}&taxon_id={str(taxon_id)}&quality_grade=research{set_page_nbr if page is not None else ''}&per_page=200&order=desc&order_by=created_at"
+    set_place_str = f"&place_id={str(place_id)}" if place_id else ''
+    set_page_nbr = f"&page={str(page)}" if page else ''
+    return f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&license=cc-by%2Ccc-by-sa%2Ccc0&photo_license=cc-by%2Ccc-by-sa%2Ccc0{set_place_str}&taxon_id={str(taxon_id)}&quality_grade=research{set_page_nbr}&per_page=200&order=desc&order_by=created_at"
 
-
-@retry(
-    stop_max_attempt_number=10,
-    wait_fixed=2000,
-    retry_on_exception=lambda ex: isinstance(ex, RequestException),
-)
+@retry(stop_max_attempt_number=10, wait_fixed=2000, retry_on_exception=lambda ex: isinstance(ex, RequestException))
 def download_image(url, tgt_path):
     global current_sleep, min_sleep
     try:
@@ -47,11 +35,10 @@ def download_image(url, tgt_path):
                 print("Too many requests error!")
                 current_sleep *= 2
                 raise RequestException("Too Many Requests")
-            elif response.status_code != 200:
+            else:
                 raise RequestException(f"HTTP Error {response.status_code}")
-    except Exception as e:
+    except Exception:
         raise RequestException()
-
 
 def extract_images_from_response(data, tgt_path, page=0, get_all_images=False, image_size='medium'):
     """
@@ -66,59 +53,79 @@ def extract_images_from_response(data, tgt_path, page=0, get_all_images=False, i
     if 'results' not in data.keys():
         print(f"page {page}: No result retrieved!")
         return
-    num_results = len(data['results'])
-    for i in range(num_results):
-        n_photos = len(data['results'][i]['photos'])
-        for j in range(n_photos):
-            url = data['results'][i]['photos'][j]['url']
+    for i, obs in enumerate(data['results']):
+        for j, photo in enumerate(obs.get('photos', [])):
+            url = photo['url']
             image_name = url.split('/')[-1]
             image_format = image_name.split('.')[-1]
             url_path = '/'.join(url.split('/')[:-1])
             orig_url = f"{url_path}/{image_size}.{image_format}"
-
             im_id = f"{page}-{i}-{j}"
             download_image(orig_url, f"{tgt_path}/{im_id}.{image_format}")
             sleep(current_sleep)
             if not get_all_images:
                 break
 
+def save_checkpoint(index, page):
+    os.makedirs(data_path, exist_ok=True)
+    with open(checkpoint_path, 'w') as f:
+        json.dump({'species_index': index, 'current_page': page}, f)
 
-def main(species_data_src, place_id=None, image_size='medium'):
+def load_checkpoint():
+    if exists(checkpoint_path):
+        with open(checkpoint_path, 'r') as f:
+            return json.load(f)
+    return None
+
+def main(species_data_src, place_id=None, image_size='medium', force_restart=False):
     species_data = pd.read_csv(species_data_src)
-    taxon_ids = species_data['id']
-
-    # Creating a dictionary where 'taxon_key' is the key and 'species_name' is the value
+    taxon_ids = species_data['id'].tolist()
     taxon_species_dict = dict(zip(taxon_ids, species_data['name']))
-    print(f"Found {len(taxon_species_dict)} species to download...")
+    print(f"Found {len(taxon_ids)} species to download...")
 
-    params = {'format': 'json'}
+    os.makedirs(data_path, exist_ok=True)
 
-    for taxon_id in taxon_ids:
-        #base_query = f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&taxon_id={str(taxon_id)}&quality_grade=research&per_page=200&order=desc&order_by=created_at"
-        base_query = get_query(taxon_id, place_id)
-        response = requests.get(base_query, params=params)
+    # Create all directories up front
+    for species_name in taxon_species_dict.values():
+        species_path = os.path.join(data_path, species_name)
+        os.makedirs(species_path, exist_ok=True)
+
+    start_index, start_page = 0, 1
+    if not force_restart:
+        checkpoint = load_checkpoint()
+        if checkpoint:
+            start_index = checkpoint.get('species_index', 0)
+            start_page = checkpoint.get('current_page', 1)
+            print(f"Resuming from checkpoint: species index {start_index}, page {start_page}")
+
+    for idx, taxon_id in enumerate(taxon_ids[start_index:], start=start_index):
+        species_name = taxon_species_dict[taxon_id]
+        im_data_path = os.path.join(data_path, species_name)
+
+        query = get_query(taxon_id, place_id)
+        response = requests.get(query)
         data = response.json()
-        n_obs = data['total_results']
-        im_data_path = f"{data_path}/{taxon_species_dict[taxon_id]}"
-        if not exists(im_data_path):
-            mkdir(im_data_path)
-        get_all_images = True  # Retrieve all images for each observation
-
+        n_obs = data.get('total_results', 0)
         n_pages = (n_obs // 200) + 1
 
-        print(f"Collecting images for {taxon_species_dict[taxon_id]}...")
-        extract_images_from_response(data, im_data_path, 1, get_all_images=get_all_images, image_size=image_size)
-        for p in tqdm(range(2, n_pages+1)):
-            query = get_query(taxon_id, place_id, page=p)
-            response = requests.get(query, params=params)
-            data = response.json()
-            extract_images_from_response(data, im_data_path, page=p, get_all_images=get_all_images, image_size=image_size)
-    print("Done!")
+        print(f"Collecting images for {species_name} (ID {taxon_id}) - {n_obs} observations, {n_pages} pages")
+        get_all_images = True
 
+        # Resume from correct page
+        for page in tqdm(range(start_page, n_pages + 1), desc=f"{species_name}"):
+            query = get_query(taxon_id, place_id, page=page)
+            response = requests.get(query)
+            data = response.json()
+            extract_images_from_response(data, im_data_path, page=page, get_all_images=get_all_images, image_size=image_size)
+            save_checkpoint(idx, page + 1)  # Save after each page
+
+        start_page = 1  # Reset for next species
+
+    print("All downloads completed.")
 
 if __name__ == "__main__":
     species_data_src = "data/02_taxon_collected_data.csv"
-    place_id = 6803  # New Zealand place ID
+    place_id = 6803  # New Zealand
     image_size = 'medium'
-    main(species_data_src, place_id, image_size=image_size)
-
+    force_restart = False  # Set to True to ignore checkpoint
+    main(species_data_src, place_id, image_size=image_size, force_restart=force_restart)
