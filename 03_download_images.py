@@ -13,8 +13,6 @@ from tqdm import tqdm
 min_sleep = 0.2
 current_sleep = min_sleep
 image_sizes = ["square", "thumb", "small", "medium", "large", "original"]
-data_path = "data"
-checkpoint_path = os.path.join(data_path, "checkpoint.json")
 
 def get_query(taxon_id, place_id=None, page=None):
     set_place_str = f"&place_id={str(place_id)}" if place_id else ''
@@ -40,7 +38,7 @@ def download_image(url, tgt_path):
     except Exception:
         raise RequestException()
 
-def extract_images_from_response(data, tgt_path, page=0, get_all_images=False, image_size='medium'):
+def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium'):
     """
     Retrieve images for each observation. If 'get_all_images' is True, retrieves all images under the observation.
     :param data:
@@ -50,9 +48,11 @@ def extract_images_from_response(data, tgt_path, page=0, get_all_images=False, i
     :param image_size:
     :return:
     """
+    species_id_prefix = f"{str(species_id)}_" if species_id else ""
     if 'results' not in data.keys():
         print(f"page {page}: No result retrieved!")
         return
+    #for i, obs in enumerate(data['results'][:3]):  # FOR TESTING ONLY ---------------
     for i, obs in enumerate(data['results']):
         for j, photo in enumerate(obs.get('photos', [])):
             url = photo['url']
@@ -60,39 +60,42 @@ def extract_images_from_response(data, tgt_path, page=0, get_all_images=False, i
             image_format = image_name.split('.')[-1]
             url_path = '/'.join(url.split('/')[:-1])
             orig_url = f"{url_path}/{image_size}.{image_format}"
-            im_id = f"{page}-{i}-{j}"
+            im_id = f"{species_id_prefix}{page}-{i}-{j}"
             download_image(orig_url, f"{tgt_path}/{im_id}.{image_format}")
             sleep(current_sleep)
             if not get_all_images:
                 break
 
-def save_checkpoint(index, page):
+def save_checkpoint(data_path, checkpoint_path, index, page):
     os.makedirs(data_path, exist_ok=True)
     with open(checkpoint_path, 'w') as f:
         json.dump({'species_index': index, 'current_page': page}, f)
 
-def load_checkpoint():
+def load_checkpoint(checkpoint_path):
     if exists(checkpoint_path):
         with open(checkpoint_path, 'r') as f:
             return json.load(f)
     return None
 
-def main(species_data_src, place_id=None, image_size='medium', force_restart=False):
+def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_restart=False):
+    checkpoint_path = os.path.join(data_tgt, "checkpoint.json")
+
     species_data = pd.read_csv(species_data_src)
+    #species_data = species_data[:2]  # FOR TESTING ONLY------------------------------
     taxon_ids = species_data['id'].tolist()
     taxon_species_dict = dict(zip(taxon_ids, species_data['name']))
     print(f"Found {len(taxon_ids)} species to download...")
 
-    os.makedirs(data_path, exist_ok=True)
+    os.makedirs(data_tgt, exist_ok=True)
 
     # Create all directories up front
     for species_name in taxon_species_dict.values():
-        species_path = os.path.join(data_path, species_name)
+        species_path = os.path.join(data_tgt, species_name)
         os.makedirs(species_path, exist_ok=True)
 
     start_index, start_page = 0, 1
     if not force_restart:
-        checkpoint = load_checkpoint()
+        checkpoint = load_checkpoint(checkpoint_path)
         if checkpoint:
             start_index = checkpoint.get('species_index', 0)
             start_page = checkpoint.get('current_page', 1)
@@ -100,13 +103,14 @@ def main(species_data_src, place_id=None, image_size='medium', force_restart=Fal
 
     for idx, taxon_id in enumerate(taxon_ids[start_index:], start=start_index):
         species_name = taxon_species_dict[taxon_id]
-        im_data_path = os.path.join(data_path, species_name)
+        im_data_path = os.path.join(data_tgt, species_name)
 
         query = get_query(taxon_id, place_id)
         response = requests.get(query)
         data = response.json()
         n_obs = data.get('total_results', 0)
         n_pages = (n_obs // 200) + 1
+        #n_pages = 1  # FOR TESTING ONLY ------------------
 
         print(f"Collecting images for {species_name} (ID {taxon_id}) - {n_obs} observations, {n_pages} pages")
         get_all_images = True
@@ -116,8 +120,8 @@ def main(species_data_src, place_id=None, image_size='medium', force_restart=Fal
             query = get_query(taxon_id, place_id, page=page)
             response = requests.get(query)
             data = response.json()
-            extract_images_from_response(data, im_data_path, page=page, get_all_images=get_all_images, image_size=image_size)
-            save_checkpoint(idx, page + 1)  # Save after each page
+            extract_images_from_response(data, im_data_path, page=page, species_id=taxon_id, get_all_images=get_all_images, image_size=image_size)
+            save_checkpoint(data_tgt, checkpoint_path, idx, page + 1)  # Save after each page
 
         start_page = 1  # Reset for next species
 
@@ -125,7 +129,10 @@ def main(species_data_src, place_id=None, image_size='medium', force_restart=Fal
 
 if __name__ == "__main__":
     species_data_src = "data/02_taxon_collected_data.csv"
+    dataset_tgt = "data/species-test"
+
     place_id = 6803  # New Zealand
     image_size = 'medium'
     force_restart = False  # Set to True to ignore checkpoint
-    main(species_data_src, place_id, image_size=image_size, force_restart=force_restart)
+    main(dataset_tgt, species_data_src, place_id, image_size=image_size, force_restart=force_restart)
+
