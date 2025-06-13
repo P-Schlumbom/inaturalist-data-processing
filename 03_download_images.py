@@ -12,7 +12,7 @@ from os import mkdir
 from os.path import exists
 from tqdm import tqdm
 
-min_sleep = 0.2
+min_sleep = 0.1
 current_sleep = min_sleep
 image_sizes = ["square", "thumb", "small", "medium", "large", "original"]
 
@@ -21,7 +21,8 @@ def get_query(taxon_id, place_id=None, page=None):
     set_page_nbr = f"&page={str(page)}" if page else ''
     return f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&license=cc-by%2Ccc-by-sa%2Ccc0&photo_license=cc-by%2Ccc-by-sa%2Ccc0{set_place_str}&taxon_id={str(taxon_id)}&quality_grade=research{set_page_nbr}&per_page=200&order=desc&order_by=created_at"
 
-@retry(stop_max_attempt_number=10, wait_fixed=2000, retry_on_exception=lambda ex: isinstance(ex, RequestException))
+@retry(stop_max_attempt_number=10, wait_fixed=2000,
+       retry_on_exception=lambda ex: isinstance(ex, RequestException) and "Retryable" in str(ex))
 def download_image(url, tgt_path):
     global current_sleep, min_sleep
     try:
@@ -30,17 +31,25 @@ def download_image(url, tgt_path):
             current_sleep = max(min_sleep, current_sleep * 0.5)
             with open(tgt_path, 'wb') as file:
                 file.write(response.content)
+        elif response.status_code == 429:
+            print("Too many requests error!", flush=True)
+            current_sleep = min(current_sleep * 2, 60)
+            if current_sleep > 10:
+                print(f"current_sleep set to {current_sleep}", flush=True)
+            raise RequestException("Retryable: Too Many Requests")
+        elif response.status_code == 404:
+            print(f"Image not found (404): {url}", flush=True)
+            # Don't raise; just skip this image
         else:
-            if response.status_code == 429:
-                print("Too many requests error!", flush=True)
-                current_sleep = min(current_sleep * 2, 60)
-                if current_sleep > 10:
-                    print(f"current_sleep set to {current_sleep}", flush=True)
-                raise RequestException("Too Many Requests")
-            else:
-                raise RequestException(f"HTTP Error {response.status_code}")
-    except Exception:
-        raise RequestException()
+            print(f"Non-retryable HTTP error {response.status_code} for URL: {url}", flush=True)
+            # Don't retry for these either
+    except requests.exceptions.Timeout:
+        print(f"Timeout while downloading {url}", flush=True)
+        raise RequestException("Retryable: Timeout")
+    except Exception as e:
+        print(f"Unexpected error for {url}: {e}", flush=True)
+        raise RequestException("Retryable: Unexpected error")
+
 
 def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium'):
     """
