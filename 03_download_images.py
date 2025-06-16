@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 from time import sleep
 from retrying import retry
-from requests.exceptions import RequestException
+from requests.exceptions import RequestException, Timeout
 from os import mkdir
 from os.path import exists
 from tqdm import tqdm
@@ -21,7 +21,7 @@ def get_query(taxon_id, place_id=None, page=None):
     set_page_nbr = f"&page={str(page)}" if page else ''
     return f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&license=cc-by%2Ccc-by-sa%2Ccc0&photo_license=cc-by%2Ccc-by-sa%2Ccc0{set_place_str}&taxon_id={str(taxon_id)}&quality_grade=research{set_page_nbr}&per_page=200&order=desc&order_by=created_at"
 
-@retry(stop_max_attempt_number=10, wait_fixed=2000,
+"""@retry(stop_max_attempt_number=10, wait_fixed=2000,
        retry_on_exception=lambda ex: isinstance(ex, RequestException) and "Retryable" in str(ex))
 def download_image(url, tgt_path):
     global current_sleep, min_sleep
@@ -48,7 +48,53 @@ def download_image(url, tgt_path):
         raise RequestException("Retryable: Timeout")
     except Exception as e:
         print(f"Unexpected error for {url}: {e}", flush=True)
-        raise RequestException("Retryable: Unexpected error")
+        raise RequestException("Retryable: Unexpected error")"""
+
+
+@retry(
+    stop_max_attempt_number=5,
+    wait_exponential_multiplier=500,
+    wait_exponential_max=10000,
+    retry_on_exception=lambda ex: isinstance(ex, RequestException)
+)
+def download_image(url, tgt_path):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            with open(tgt_path, 'wb') as file:
+                file.write(response.content)
+        elif response.status_code == 404:
+            print(f"Image not found (404): {url}", flush=True)
+        else:
+            raise RequestException(f"Image HTTP Error {response.status_code}")
+    except Exception as e:
+        raise RequestException(f"Download exception: {e}")
+
+
+@retry(
+    stop_max_attempt_number=10,
+    wait_exponential_multiplier=1000,
+    wait_exponential_max=60000,
+    retry_on_exception=lambda ex: isinstance(ex, RequestException) and (
+        "429" in str(ex) or "Timeout" in str(ex))
+)
+def get_api_response(url):
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response
+        elif response.status_code == 429:
+            print("Too many requests error!", flush=True)
+            raise RequestException("429: Too Many Requests")
+        else:
+            print(f"API Error {response.status_code} for {url}", flush=True)
+            raise RequestException(f"{response.status_code}: Unrecoverable API error")
+    except Timeout:
+        print(f"Timeout occurred for {url}", flush=True)
+        raise RequestException("Timeout")
+    except Exception as e:
+        print(f"Unexpected error: {e}", flush=True)
+        raise RequestException(str(e))
 
 
 def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium'):
@@ -76,7 +122,7 @@ def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_al
             im_id = f"{species_id_prefix}{page}-{i}-{j}"
             #print(f"{i}, {j}: downloading image...", flush=True)
             download_image(orig_url, f"{tgt_path}/{im_id}.{image_format}")
-            sleep(current_sleep)
+            #sleep(current_sleep)
             if not get_all_images:
                 break
 
@@ -136,12 +182,10 @@ def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_r
         # Resume from correct page
         for page in tqdm(range(start_page, n_pages + 1), desc=f"{species_name} ({idx+1}/{len(taxon_ids[start_index:])})"):
             print()
-            #print("getting query...", flush=True)
             query = get_query(taxon_id, place_id, page=page)
-            #print("getting response...", flush=True)
-            response = requests.get(query)
+            #response = requests.get(query)
+            response = get_api_response(query)
             data = response.json()
-            #print("extracting images...", flush=True)
             extract_images_from_response(data, im_data_path, page=page, species_id=taxon_id, get_all_images=get_all_images, image_size=image_size)
             save_checkpoint(data_tgt, checkpoint_path, idx, page + 1)  # Save after each page
 
