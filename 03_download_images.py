@@ -1,3 +1,4 @@
+import sys
 import os
 import json
 import math
@@ -7,54 +8,26 @@ import pandas as pd
 import requests
 from time import sleep
 from retrying import retry
-from requests.exceptions import RequestException, Timeout
+from requests.exceptions import RequestException, Timeout, SSLError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import mkdir
 from os.path import exists
 from tqdm import tqdm
 
-min_sleep = 0.1
+min_sleep = 0.05
 current_sleep = min_sleep
 image_sizes = ["square", "thumb", "small", "medium", "large", "original"]
+
 
 def get_query(taxon_id, place_id=None, page=None):
     set_place_str = f"&place_id={str(place_id)}" if place_id else ''
     set_page_nbr = f"&page={str(page)}" if page else ''
     return f"https://api.inaturalist.org/v1/observations?identified=true&photos=true&license=cc-by%2Ccc-by-sa%2Ccc0&photo_license=cc-by%2Ccc-by-sa%2Ccc0{set_place_str}&taxon_id={str(taxon_id)}&quality_grade=research{set_page_nbr}&per_page=200&order=desc&order_by=created_at"
 
-"""@retry(stop_max_attempt_number=10, wait_fixed=2000,
-       retry_on_exception=lambda ex: isinstance(ex, RequestException) and "Retryable" in str(ex))
-def download_image(url, tgt_path):
-    global current_sleep, min_sleep
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            current_sleep = max(min_sleep, current_sleep * 0.5)
-            with open(tgt_path, 'wb') as file:
-                file.write(response.content)
-        elif response.status_code == 429:
-            print("Too many requests error!", flush=True)
-            current_sleep = min(current_sleep * 2, 60)
-            if current_sleep > 10:
-                print(f"current_sleep set to {current_sleep}", flush=True)
-            raise RequestException("Retryable: Too Many Requests")
-        elif response.status_code == 404:
-            print(f"Image not found (404): {url}", flush=True)
-            # Don't raise; just skip this image
-        else:
-            print(f"Non-retryable HTTP error {response.status_code} for URL: {url}", flush=True)
-            # Don't retry for these either
-    except requests.exceptions.Timeout:
-        print(f"Timeout while downloading {url}", flush=True)
-        raise RequestException("Retryable: Timeout")
-    except Exception as e:
-        print(f"Unexpected error for {url}: {e}", flush=True)
-        raise RequestException("Retryable: Unexpected error")"""
-
 
 @retry(
     stop_max_attempt_number=5,
-    wait_exponential_multiplier=500,
-    wait_exponential_max=10000,
+    wait_fixed=1000,
     retry_on_exception=lambda ex: isinstance(ex, RequestException)
 )
 def download_image(url, tgt_path):
@@ -71,11 +44,25 @@ def download_image(url, tgt_path):
         raise RequestException(f"Download exception: {e}")
 
 
+def download_single_image(species_id_prefix, page, i, j, photo, image_size, tgt_path):
+    url = photo['url']
+    image_name = url.split('/')[-1]
+    image_format = image_name.split('.')[-1]
+    url_path = '/'.join(url.split('/')[:-1])
+    orig_url = f"{url_path}/{image_size}.{image_format}"
+    im_id = f"{species_id_prefix}{page}-{i}-{j}"
+    tgt_file = f"{tgt_path}/{im_id}.{image_format}"
+    try:
+        download_image(orig_url, tgt_file)
+    except Exception as e:
+        print(f"[WARN] Failed to download image {orig_url}: {e}", flush=True)
+
+
 @retry(
     stop_max_attempt_number=10,
     wait_exponential_multiplier=1000,
     wait_exponential_max=60000,
-    retry_on_exception=lambda ex: isinstance(ex, RequestException) and (
+    retry_on_exception=lambda ex: isinstance(ex, (RequestException, SSLError)) and (
         "429" in str(ex) or "Timeout" in str(ex))
 )
 def get_api_response(url):
@@ -97,7 +84,7 @@ def get_api_response(url):
         raise RequestException(str(e))
 
 
-def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium'):
+def extract_images_from_response_single(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium'):
     """
     Retrieve images for each observation. If 'get_all_images' is True, retrieves all images under the observation.
     :param data:
@@ -126,6 +113,34 @@ def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_al
             if not get_all_images:
                 break
 
+
+def extract_images_from_response(data, tgt_path, page=0, species_id=None, get_all_images=False, image_size='medium', max_workers=10, total_pages=None):
+    if total_pages is None: total_pages = page
+    species_id_prefix = f"{str(species_id)}_" if species_id else ""
+    if 'results' not in data:
+        print(f"page {page}: No result retrieved!", flush=True)
+        return
+
+    tasks = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for i, obs in enumerate(data['results']):
+            photos = obs.get('photos', [])
+            if not photos:
+                continue
+
+            # Always download the first photo
+            tasks.append(executor.submit(download_single_image,
+                                         species_id_prefix, page, i, 0, photos[0], image_size, tgt_path))
+
+            if get_all_images:
+                for j, photo in enumerate(photos[1:], start=1):
+                    tasks.append(executor.submit(download_single_image,
+                                                 species_id_prefix, page, i, j, photo, image_size, tgt_path))
+
+        for future in tqdm(as_completed(tasks), total=len(tasks), desc=f"Downloading page {page}/{total_pages} images", position=0, leave=True):
+            _ = future.result()  # This will raise any exceptions that occurred
+
+
 def save_checkpoint(data_path, checkpoint_path, index, page):
     os.makedirs(data_path, exist_ok=True)
     with open(checkpoint_path, 'w') as f:
@@ -137,7 +152,7 @@ def load_checkpoint(checkpoint_path):
             return json.load(f)
     return None
 
-def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_restart=False):
+def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_restart=False, max_workers=10):
     checkpoint_path = os.path.join(data_tgt, "checkpoint.json")
 
     species_data = pd.read_csv(species_data_src)
@@ -170,7 +185,7 @@ def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_r
         start_time = time.time()  # Start timing
 
         query = get_query(taxon_id, place_id)
-        response = requests.get(query)
+        response = get_api_response(query)
         data = response.json()
         n_obs = data.get('total_results', 0)
         n_pages = (n_obs // 200) + 1
@@ -186,7 +201,7 @@ def main(data_tgt, species_data_src, place_id=None, image_size='medium', force_r
             #response = requests.get(query)
             response = get_api_response(query)
             data = response.json()
-            extract_images_from_response(data, im_data_path, page=page, species_id=taxon_id, get_all_images=get_all_images, image_size=image_size)
+            extract_images_from_response(data, im_data_path, page=page, species_id=taxon_id, get_all_images=get_all_images, image_size=image_size, max_workers=20, total_pages=n_pages)
             save_checkpoint(data_tgt, checkpoint_path, idx, page + 1)  # Save after each page
 
         # End timing
@@ -212,5 +227,6 @@ if __name__ == "__main__":
     place_id = 6803  # New Zealand
     image_size = 'medium'
     force_restart = False  # Set to True to ignore checkpoint
-    main(dataset_tgt, species_data_src, place_id, image_size=image_size, force_restart=force_restart)
+    max_workers = 40
+    main(dataset_tgt, species_data_src, place_id, image_size=image_size, force_restart=force_restart, max_workers=max_workers)
 
